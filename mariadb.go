@@ -338,7 +338,7 @@ func (r Repository[Entity, ID]) buildWhereClause(qargs flsql.QueryArgs) (string,
 // Upsert inserts new entities or updates existing ones if they already exist.
 func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity) (rErr error) {
 	if len(entities) == 0 {
-		return fmt.Errorf("no entities provided to Upsert")
+		return nil
 	}
 
 	ctx, err := r.BeginTx(ctx)
