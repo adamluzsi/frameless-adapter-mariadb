@@ -19,6 +19,7 @@ import (
 )
 
 func TestRepository(t *testing.T) {
+	logger.Testing(t)
 	cm := GetConnection(t)
 
 	subject := &mariadb.Repository[Entity, EntityID]{
@@ -38,6 +39,7 @@ func TestRepository(t *testing.T) {
 	testcase.RunSuite(t,
 		crudcontracts.Creator[Entity, EntityID](subject, config),
 		crudcontracts.Finder[Entity, EntityID](subject, config),
+		crudcontracts.ByIDsFinder[Entity, EntityID](subject, config),
 		crudcontracts.Updater[Entity, EntityID](subject, config),
 		crudcontracts.Deleter[Entity, EntityID](subject, config),
 		crudcontracts.OnePhaseCommitProtocol[Entity, EntityID](subject, subject.Connection),

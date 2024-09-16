@@ -56,12 +56,12 @@ func Connect(dsn string) (Connection, error) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Repository implements CRUD operations for a specific entity type in mariadb.
-type Repository[Entity, ID any] struct {
+type Repository[ENT, ID any] struct {
 	Connection Connection
-	Mapping    flsql.Mapping[Entity, ID]
+	Mapping    flsql.Mapping[ENT, ID]
 }
 
-func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr error) {
+func (r Repository[ENT, ID]) Create(ctx context.Context, ptr *ENT) (rErr error) {
 	if ptr == nil {
 		return fmt.Errorf("nil entity pointer given to Create")
 	}
@@ -85,7 +85,7 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 		}
 		if found {
 			return errorkit.With(crud.ErrAlreadyExists).
-				Detailf(`%T already exists with id: %v`, *new(Entity), id).
+				Detailf(`%T already exists with id: %v`, *new(ENT), id).
 				Context(ctx).
 				Unwrap()
 		}
@@ -115,7 +115,7 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 
 	row := r.Connection.QueryRowContext(ctx, query, valuesArgs...)
 
-	var got Entity
+	var got ENT
 	if err := mapscan(&got, row); err != nil {
 		return err
 	}
@@ -124,12 +124,12 @@ func (r Repository[Entity, ID]) Create(ctx context.Context, ptr *Entity) (rErr e
 	return nil
 }
 
-func (r Repository[Entity, ID]) FindByID(ctx context.Context, id ID) (Entity, bool, error) {
+func (r Repository[ENT, ID]) FindByID(ctx context.Context, id ID) (ENT, bool, error) {
 	var queryArgs []any
 
 	idArgs, err := r.Mapping.QueryID(id)
 	if err != nil {
-		return *new(Entity), false, err
+		return *new(ENT), false, err
 	}
 
 	cols, scan := r.Mapping.ToQuery(ctx)
@@ -145,20 +145,20 @@ func (r Repository[Entity, ID]) FindByID(ctx context.Context, id ID) (Entity, bo
 
 	row := r.Connection.QueryRowContext(ctx, query, queryArgs...)
 
-	var v Entity
+	var v ENT
 	err = scan(&v, row)
 	if errors.Is(err, sql.ErrNoRows) {
-		return *new(Entity), false, nil
+		return *new(ENT), false, nil
 	}
 
 	if err != nil {
-		return *new(Entity), false, err
+		return *new(ENT), false, err
 	}
 
 	return v, true, nil
 }
 
-func (r Repository[Entity, ID]) DeleteAll(ctx context.Context) (rErr error) {
+func (r Repository[ENT, ID]) DeleteAll(ctx context.Context) (rErr error) {
 	ctx, err := r.BeginTx(ctx)
 	if err != nil {
 		return err
@@ -174,7 +174,7 @@ func (r Repository[Entity, ID]) DeleteAll(ctx context.Context) (rErr error) {
 	return nil
 }
 
-func (r Repository[Entity, ID]) DeleteByID(ctx context.Context, id ID) (rErr error) {
+func (r Repository[ENT, ID]) DeleteByID(ctx context.Context, id ID) (rErr error) {
 	idArgs, err := r.Mapping.QueryID(id)
 	if err != nil {
 		return err
@@ -207,7 +207,7 @@ func (r Repository[Entity, ID]) DeleteByID(ctx context.Context, id ID) (rErr err
 	return nil
 }
 
-func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr error) {
+func (r Repository[ENT, ID]) Update(ctx context.Context, ptr *ENT) (rErr error) {
 	if ptr == nil {
 		return fmt.Errorf("nil entity pointer received in Update")
 	}
@@ -267,7 +267,7 @@ func (r Repository[Entity, ID]) Update(ctx context.Context, ptr *Entity) (rErr e
 	return nil
 }
 
-func (r Repository[Entity, ID]) FindAll(ctx context.Context) iterators.Iterator[Entity] {
+func (r Repository[ENT, ID]) FindAll(ctx context.Context) iterators.Iterator[ENT] {
 	cols, scan := r.Mapping.ToQuery(ctx)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
@@ -277,13 +277,16 @@ func (r Repository[Entity, ID]) FindAll(ctx context.Context) iterators.Iterator[
 
 	rows, err := r.Connection.QueryContext(ctx, query)
 	if err != nil {
-		return iterators.Error[Entity](err)
+		return iterators.Error[ENT](err)
 	}
 
-	return flsql.MakeSQLRowsIterator[Entity](rows, scan)
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
 }
 
-func (r Repository[Entity, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators.Iterator[Entity] {
+func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators.Iterator[ENT] {
+	if len(ids) == 0 {
+		return iterators.Empty[ENT]()
+	}
 	var (
 		whereClauses []string
 		queryArgs    []interface{}
@@ -292,7 +295,7 @@ func (r Repository[Entity, ID]) FindByIDs(ctx context.Context, ids ...ID) iterat
 	for _, id := range ids {
 		idArgs, err := r.Mapping.QueryID(id)
 		if err != nil {
-			return iterators.Error[Entity](err)
+			return iterators.Error[ENT](err)
 		}
 		whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
 		whereClauses = append(whereClauses, fmt.Sprintf("(%s)", whereClauseQuery))
@@ -309,34 +312,34 @@ func (r Repository[Entity, ID]) FindByIDs(ctx context.Context, ids ...ID) iterat
 
 	rows, err := r.Connection.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
-		return iterators.Error[Entity](err)
+		return iterators.Error[ENT](err)
 	}
 
-	return flsql.MakeSQLRowsIterator[Entity](rows, scan)
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.
-func (r Repository[Entity, ID]) BeginTx(ctx context.Context) (context.Context, error) {
+func (r Repository[ENT, ID]) BeginTx(ctx context.Context) (context.Context, error) {
 	return r.Connection.BeginTx(ctx)
 }
 
 // CommitTx implements the comproto.OnePhaseCommitter interface.
-func (r Repository[Entity, ID]) CommitTx(ctx context.Context) error {
+func (r Repository[ENT, ID]) CommitTx(ctx context.Context) error {
 	return r.Connection.CommitTx(ctx)
 }
 
 // RollbackTx implements the comproto.OnePhaseCommitter interface.
-func (r Repository[Entity, ID]) RollbackTx(ctx context.Context) error {
+func (r Repository[ENT, ID]) RollbackTx(ctx context.Context) error {
 	return r.Connection.RollbackTx(ctx)
 }
 
-func (r Repository[Entity, ID]) buildWhereClause(qargs flsql.QueryArgs) (string, []any) {
+func (r Repository[ENT, ID]) buildWhereClause(qargs flsql.QueryArgs) (string, []any) {
 	cols, args := flsql.SplitArgs(qargs)
 	return flsql.JoinColumnName(cols, "`%s` = ?", " AND "), args
 }
 
 // Upsert inserts new entities or updates existing ones if they already exist.
-func (r Repository[Entity, ID]) Upsert(ctx context.Context, entities ...*Entity) (rErr error) {
+func (r Repository[ENT, ID]) Upsert(ctx context.Context, entities ...*ENT) (rErr error) {
 	if len(entities) == 0 {
 		return nil
 	}
