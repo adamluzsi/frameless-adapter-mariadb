@@ -77,19 +77,6 @@ func TestCacheRepository(t *testing.T) {
 	cachecontracts.Repository(subject, c).Test(t)
 }
 
-func TestRepository_Upsert_noEntity(t *testing.T) {
-	cm := GetConnection(t)
-
-	subject := &mariadb.Repository[Entity, EntityID]{
-		Connection: cm,
-		Mapping:    EntityMapping(),
-	}
-
-	MigrateEntity(t, cm)
-
-	assert.NoError(t, subject.Upsert(context.Background()))
-}
-
 func TestMigrationStateRepository(t *testing.T) {
 	logger.Testing(t)
 	ctx := context.Background()

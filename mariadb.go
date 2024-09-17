@@ -315,7 +315,28 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators
 		return iterators.Error[ENT](err)
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
+	iter := flsql.MakeSQLRowsIterator[ENT](rows, scan)
+
+	var hits = map[string]struct{}{}
+
+	var toKey = func(id ID) string {
+		return fmt.Sprintf("%#v", id)
+	}
+	return iterators.Func[ENT](func() (v ENT, ok bool, err error) {
+		if !iter.Next() {
+			for _, id := range ids {
+				if _, ok := hits[toKey(id)]; !ok {
+					return v, ok, crud.ErrNotFound
+				}
+			}
+			return
+		}
+		val := iter.Value()
+		if id, ok := r.Mapping.ID.Lookup(val); ok {
+			hits[toKey(id)] = struct{}{}
+		}
+		return val, true, iter.Err()
+	}, iterators.OnClose(iter.Close))
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.
@@ -338,66 +359,59 @@ func (r Repository[ENT, ID]) buildWhereClause(qargs flsql.QueryArgs) (string, []
 	return flsql.JoinColumnName(cols, "`%s` = ?", " AND "), args
 }
 
-// Upsert inserts new entities or updates existing ones if they already exist.
-func (r Repository[ENT, ID]) Upsert(ctx context.Context, entities ...*ENT) (rErr error) {
-	if len(entities) == 0 {
-		return nil
-	}
-
+func (r Repository[ENT, ID]) Save(ctx context.Context, ptr *ENT) (rErr error) {
 	ctx, err := r.BeginTx(ctx)
 	if err != nil {
 		return err
 	}
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
-	for _, ptr := range entities {
-		if ptr == nil {
-			return fmt.Errorf("nil entity pointer given to Upsert")
-		}
+	if ptr == nil {
+		return fmt.Errorf("nil entity pointer given to Upsert")
+	}
 
-		if _, ok := r.Mapping.ID.Lookup(*ptr); !ok && r.Mapping.CreatePrepare != nil {
-			// if ID is not found, we assume it was never created before, so create peparation is required.
-			if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
-				return err
-			}
-		}
-
-		// Prepare the entity's arguments
-		args, err := r.Mapping.ToArgs(*ptr)
-		if err != nil {
+	if _, ok := r.Mapping.ID.Lookup(*ptr); !ok && r.Mapping.CreatePrepare != nil {
+		// if ID is not found, we assume it was never created before, so create peparation is required.
+		if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
 			return err
 		}
+	}
 
-		cols, values := flsql.SplitArgs(args)
-		valuesClause := make([]string, len(cols))
-		for i := range cols {
-			valuesClause[i] = "?"
-		}
+	// Prepare the entity's arguments
+	args, err := r.Mapping.ToArgs(*ptr)
+	if err != nil {
+		return err
+	}
 
-		// Prepare update clause for ON DUPLICATE KEY UPDATE
-		updateClause := strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = VALUES(`%s`)", c, c) }), ", ")
+	cols, values := flsql.SplitArgs(args)
+	valuesClause := make([]string, len(cols))
+	for i := range cols {
+		valuesClause[i] = "?"
+	}
 
-		rcolumns, mapscan := r.Mapping.ToQuery(contextkit.WithoutValues(ctx))
+	// Prepare update clause for ON DUPLICATE KEY UPDATE
+	updateClause := strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return fmt.Sprintf("`%s` = VALUES(`%s`)", c, c) }), ", ")
 
-		// Construct the UPSERT query
-		query := fmt.Sprintf(
-			"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s RETURNING %s",
-			r.Mapping.TableName,
-			strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
-			strings.Join(valuesClause, ", "),
-			updateClause,
-			flsql.JoinColumnName(rcolumns, "`%s`", ", "),
-		)
+	rcolumns, mapscan := r.Mapping.ToQuery(contextkit.WithoutValues(ctx))
 
-		logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
-			"query": query,
-			"args":  values,
-		})
+	// Construct the UPSERT query
+	query := fmt.Sprintf(
+		"INSERT INTO `%s` (`%s`) VALUES (%s) ON DUPLICATE KEY UPDATE %s RETURNING %s",
+		r.Mapping.TableName,
+		strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
+		strings.Join(valuesClause, ", "),
+		updateClause,
+		flsql.JoinColumnName(rcolumns, "`%s`", ", "),
+	)
 
-		// Execute the query
-		if err := mapscan(ptr, r.Connection.QueryRowContext(ctx, query, values...)); err != nil {
-			return err
-		}
+	logger.Debug(ctx, "mysql Repository Upsert", logging.Fields{
+		"query": query,
+		"args":  values,
+	})
+
+	// Execute the query
+	if err := mapscan(ptr, r.Connection.QueryRowContext(ctx, query, values...)); err != nil {
+		return err
 	}
 
 	return nil
