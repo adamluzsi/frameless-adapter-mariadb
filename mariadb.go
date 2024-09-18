@@ -267,7 +267,7 @@ func (r Repository[ENT, ID]) Update(ctx context.Context, ptr *ENT) (rErr error) 
 	return nil
 }
 
-func (r Repository[ENT, ID]) FindAll(ctx context.Context) iterators.Iterator[ENT] {
+func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterators.Iterator[ENT], error) {
 	cols, scan := r.Mapping.ToQuery(ctx)
 
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
@@ -277,16 +277,17 @@ func (r Repository[ENT, ID]) FindAll(ctx context.Context) iterators.Iterator[ENT
 
 	rows, err := r.Connection.QueryContext(ctx, query)
 	if err != nil {
-		return iterators.Error[ENT](err)
+		return nil, err
 	}
 
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan)
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
 }
 
-func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators.Iterator[ENT] {
+func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterators.Iterator[ENT], error) {
 	if len(ids) == 0 {
-		return iterators.Empty[ENT]()
+		return iterators.Empty[ENT](), nil
 	}
+
 	var (
 		whereClauses []string
 		queryArgs    []interface{}
@@ -295,7 +296,7 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators
 	for _, id := range ids {
 		idArgs, err := r.Mapping.QueryID(id)
 		if err != nil {
-			return iterators.Error[ENT](err)
+			return nil, err
 		}
 		whereClauseQuery, whereClauseArgs := r.buildWhereClause(idArgs)
 		whereClauses = append(whereClauses, fmt.Sprintf("(%s)", whereClauseQuery))
@@ -310,33 +311,26 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) iterators
 		strings.Join(whereClauses, " OR "),
 	)
 
+	{
+		var (
+			count      int
+			countQuery = fmt.Sprintf("SELECT COUNT(*) FROM (%s) AS `src`", query)
+		)
+		err := r.Connection.QueryRowContext(ctx, countQuery, queryArgs...).Scan(&count)
+		if err != nil {
+			return nil, err
+		}
+		if count != len(ids) {
+			return nil, crud.ErrNotFound
+		}
+	}
+
 	rows, err := r.Connection.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
-		return iterators.Error[ENT](err)
+		return nil, err
 	}
 
-	iter := flsql.MakeSQLRowsIterator[ENT](rows, scan)
-
-	var hits = map[string]struct{}{}
-
-	var toKey = func(id ID) string {
-		return fmt.Sprintf("%#v", id)
-	}
-	return iterators.Func[ENT](func() (v ENT, ok bool, err error) {
-		if !iter.Next() {
-			for _, id := range ids {
-				if _, ok := hits[toKey(id)]; !ok {
-					return v, ok, crud.ErrNotFound
-				}
-			}
-			return
-		}
-		val := iter.Value()
-		if id, ok := r.Mapping.ID.Lookup(val); ok {
-			hits[toKey(id)] = struct{}{}
-		}
-		return val, true, iter.Err()
-	}, iterators.OnClose(iter.Close))
+	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.

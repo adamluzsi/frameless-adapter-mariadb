@@ -4,7 +4,7 @@ go 1.21.5
 
 require (
 	github.com/go-sql-driver/mysql v1.8.1
-	go.llib.dev/frameless v0.242.1
+	go.llib.dev/frameless v0.243.0
 	go.llib.dev/frameless/adapter/mysql v0.3.0
 	go.llib.dev/testcase v0.161.0
 )
