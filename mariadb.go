@@ -3,9 +3,11 @@ package mariadb
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -19,10 +21,12 @@ import (
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/pkg/logging"
 	"go.llib.dev/frameless/pkg/slicekit"
+	"go.llib.dev/frameless/pkg/tasker"
 	"go.llib.dev/frameless/pkg/zerokit"
 	"go.llib.dev/frameless/port/comproto"
 	"go.llib.dev/frameless/port/crud"
 	"go.llib.dev/frameless/port/crud/extid"
+	"go.llib.dev/frameless/port/guard"
 	"go.llib.dev/frameless/port/iterators"
 	"go.llib.dev/frameless/port/migration"
 )
@@ -676,4 +680,191 @@ func MakeMigrationStateRepository(conn Connection) Repository[migration.State, m
 			ID: func(s *migration.State) *migration.StateID { return &s.ID },
 		},
 	}
+}
+
+//////////////////////////////////////////////////////////////// GUARD /////////////////////////////////////////////////////////////////
+
+// Locker is a MariaDB-based shared mutex implementation.
+type Locker struct {
+	Name       string
+	Connection Connection
+}
+
+const queryLock = `INSERT INTO frameless_guard_locks (name) VALUES (?)`
+
+func (l Locker) Lock(ctx context.Context) (context.Context, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("missing context.Context")
+	}
+
+	if _, ok := l.lookup(ctx); ok {
+		return ctx, nil
+	}
+
+	ctx, err := l.Connection.BeginTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = l.Connection.ExecContext(ctx, queryLock, l.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	lck := &lockerCtxValue{
+		ctx:        ctx,
+		cancel:     cancel,
+		Connection: l.Connection,
+	}
+	context.AfterFunc(ctx, func() {
+		_ = lck.Unclock(ctx)
+	})
+	return context.WithValue(ctx, lockerCtxKey{}, lck), nil
+}
+
+func (l Locker) Unlock(ctx context.Context) error {
+	if ctx == nil {
+		return guard.ErrNoLock
+	}
+	lck, ok := l.lookup(ctx)
+	if !ok {
+		return guard.ErrNoLock
+	}
+	return lck.Unclock(ctx)
+}
+
+type (
+	lockerCtxKey   struct{}
+	lockerCtxValue struct {
+		onUnlock   sync.Once
+		Connection Connection
+		done       bool
+		cancel     func()
+		ctx        context.Context
+	}
+)
+
+func (lck *lockerCtxValue) Unclock(ctx context.Context) (rerr error) {
+	lck.onUnlock.Do(func() {
+		if err := lck.Connection.RollbackTx(lck.ctx); err != nil {
+			if driver.ErrBadConn == err && ctx.Err() != nil {
+				rerr = ctx.Err()
+				return
+			}
+			rerr = err
+			return
+		}
+		lck.cancel()
+	})
+	return rerr
+}
+
+func (l Locker) Migrate(ctx context.Context) error {
+	return MakeMigrator(l.Connection, "frameless_guard_locks", migration.Steps[Connection]{
+		"1": flsql.MigrationStep[Connection]{UpQuery: queries.CreateTableLocker},
+	}).Migrate(ctx)
+}
+
+func (l Locker) lookup(ctx context.Context) (*lockerCtxValue, bool) {
+	v, ok := ctx.Value(lockerCtxKey{}).(*lockerCtxValue)
+	return v, ok
+}
+
+type LockerFactory[Key comparable] struct{ Connection Connection }
+
+func (lf LockerFactory[Key]) Migrate(ctx context.Context) error {
+	return Locker{Connection: lf.Connection}.Migrate(ctx)
+}
+
+func (lf LockerFactory[Key]) LockerFor(key Key) guard.Locker {
+	return Locker{Name: fmt.Sprintf("%T:%v", key, key), Connection: lf.Connection}
+}
+
+//////////////////////////////////////////////////////////////// TASKER ////////////////////////////////////////////////////////////////
+
+type TaskerSchedulerLocks struct{ Connection Connection }
+
+func (lf TaskerSchedulerLocks) factory() LockerFactory[tasker.ScheduleStateID] {
+	return LockerFactory[tasker.ScheduleStateID](lf)
+}
+
+func (lf TaskerSchedulerLocks) LockerFor(id tasker.ScheduleStateID) guard.Locker {
+	return lf.factory().LockerFor(id)
+}
+
+func (lf TaskerSchedulerLocks) Migrate(ctx context.Context) error {
+	return lf.factory().Migrate(ctx)
+}
+
+type TaskerSchedulerStateRepository struct{ Connection Connection }
+
+func (r TaskerSchedulerStateRepository) repository() Repository[tasker.ScheduleState, tasker.ScheduleStateID] {
+	return Repository[tasker.ScheduleState, tasker.ScheduleStateID]{
+		Mapping:    taskerScheduleStateRepositoryMapping,
+		Connection: r.Connection,
+	}
+}
+
+var taskerScheduleStateRepositoryMapping = flsql.Mapping[tasker.ScheduleState, tasker.ScheduleStateID]{
+	TableName: "frameless_tasker_schedule_states",
+
+	ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[tasker.ScheduleState]) {
+		return []flsql.ColumnName{"id", "timestamp"},
+			func(state *tasker.ScheduleState, s flsql.Scanner) error {
+				if err := s.Scan(&state.ID, Timestamp(&state.Timestamp)); err != nil {
+					return err
+				}
+				state.Timestamp = state.Timestamp.UTC()
+				return nil
+			}
+	},
+
+	QueryID: func(si tasker.ScheduleStateID) (flsql.QueryArgs, error) {
+		return flsql.QueryArgs{"id": si}, nil
+	},
+
+	ToArgs: func(s tasker.ScheduleState) (flsql.QueryArgs, error) {
+		return flsql.QueryArgs{
+			"id":        s.ID,
+			"timestamp": Timestamp(&s.Timestamp),
+		}, nil
+	},
+
+	Prepare: func(ctx context.Context, s *tasker.ScheduleState) error {
+		if s.ID == "" {
+			return fmt.Errorf("tasker.ScheduleState.ID is required to be supplied externally")
+		}
+		return nil
+	},
+
+	ID: func(s *tasker.ScheduleState) *tasker.ScheduleStateID {
+		return &s.ID
+	},
+}
+
+func (r TaskerSchedulerStateRepository) Migrate(ctx context.Context) error {
+	return MakeMigrator(r.Connection, "frameless_tasker_schedule_states", migration.Steps[Connection]{
+		"0": flsql.MigrationStep[Connection]{
+			UpQuery:   queries.CreateTableTaskerScheduleStates,
+			DownQuery: queries.DropTableTaskerScheduleStates,
+		},
+	}).Migrate(ctx)
+}
+
+func (r TaskerSchedulerStateRepository) Create(ctx context.Context, ptr *tasker.ScheduleState) error {
+	return r.repository().Create(ctx, ptr)
+}
+
+func (r TaskerSchedulerStateRepository) Update(ctx context.Context, ptr *tasker.ScheduleState) error {
+	return r.repository().Update(ctx, ptr)
+}
+
+func (r TaskerSchedulerStateRepository) DeleteByID(ctx context.Context, id tasker.ScheduleStateID) error {
+	return r.repository().DeleteByID(ctx, id)
+}
+
+func (r TaskerSchedulerStateRepository) FindByID(ctx context.Context, id tasker.ScheduleStateID) (ent tasker.ScheduleState, found bool, err error) {
+	return r.repository().FindByID(ctx, id)
 }

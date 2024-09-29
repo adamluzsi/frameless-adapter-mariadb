@@ -3,6 +3,8 @@ package mariadb_test
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"testing"
 
 	"go.llib.dev/frameless/adapter/mariadb"
@@ -10,12 +12,15 @@ import (
 	"go.llib.dev/frameless/pkg/cache/cachecontracts"
 	"go.llib.dev/frameless/pkg/dtokit"
 	"go.llib.dev/frameless/pkg/logger"
+	"go.llib.dev/frameless/pkg/tasker/taskercontracts"
 	"go.llib.dev/frameless/port/crud/crudcontracts"
+	"go.llib.dev/frameless/port/guard/guardcontracts"
 	"go.llib.dev/frameless/port/migration"
 	"go.llib.dev/frameless/port/migration/migrationcontracts"
 	"go.llib.dev/frameless/spechelper/testent"
 	"go.llib.dev/testcase"
 	"go.llib.dev/testcase/assert"
+	"go.llib.dev/testcase/random"
 )
 
 func TestRepository(t *testing.T) {
@@ -123,4 +128,96 @@ func TestMigrationStateRepository_smoke(t *testing.T) {
 
 	assert.NoError(t, repo.Create(ctx, &ent1))
 	assert.NoError(t, repo.DeleteAll(ctx))
+}
+
+func ExampleLocker() {
+	cm, err := mariadb.Connect(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		panic(err)
+	}
+
+	l := mariadb.Locker{
+		Name:       "my-lock",
+		Connection: cm,
+	}
+
+	ctx, err := l.Lock(context.Background())
+	if err != nil {
+		panic(err)
+	}
+
+	if err := l.Unlock(ctx); err != nil {
+		panic(err)
+	}
+}
+
+var _ migration.Migratable = mariadb.Locker{}
+
+func TestLocker(t *testing.T) {
+	cm := GetConnection(t)
+
+	l := mariadb.Locker{
+		Name:       rnd.StringNC(5, random.CharsetAlpha()),
+		Connection: cm,
+	}
+	assert.NoError(t, l.Migrate(context.Background()))
+
+	guardcontracts.Locker(l).Test(t)
+}
+
+func ExampleLockerFactory() {
+	cm, err := mariadb.Connect(os.Getenv("DATABASE_URL"))
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	lockerFactory := mariadb.LockerFactory[string]{Connection: cm}
+	if err := lockerFactory.Migrate(context.Background()); err != nil {
+		log.Fatal(err)
+	}
+
+	locker := lockerFactory.LockerFor("hello world")
+
+	ctx, err := locker.Lock(context.Background())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := locker.Unlock(ctx); err != nil {
+		log.Fatal(err)
+	}
+}
+
+var _ migration.Migratable = mariadb.LockerFactory[int]{}
+
+func TestNewLockerFactory(t *testing.T) {
+	ctx := context.Background()
+	cm := GetConnection(t)
+
+	lockerFactoryStrKey := mariadb.LockerFactory[string]{Connection: cm}
+	assert.NoError(t, lockerFactoryStrKey.Migrate(ctx))
+	guardcontracts.LockerFactory[string](lockerFactoryStrKey).Test(t)
+
+	lockerFactoryIntKey := mariadb.LockerFactory[int]{Connection: cm}
+	assert.NoError(t, lockerFactoryIntKey.Migrate(ctx))
+	guardcontracts.LockerFactory[int](lockerFactoryIntKey).Test(t)
+}
+
+var _ migration.Migratable = mariadb.TaskerSchedulerLocks{}
+var _ migration.Migratable = mariadb.TaskerSchedulerStateRepository{}
+
+func TestTaskerSchedulerStateRepository(t *testing.T) {
+	cm := GetConnection(t)
+
+	r := mariadb.TaskerSchedulerStateRepository{Connection: cm}
+	assert.NoError(t, r.Migrate(context.Background()))
+	taskercontracts.SchedulerStateRepository(r).Test(t)
+}
+
+func TestTaskerSchedulerLocks(t *testing.T) {
+	cm := GetConnection(t)
+
+	l := mariadb.TaskerSchedulerLocks{Connection: cm}
+	assert.NoError(t, l.Migrate(context.Background()))
+	taskercontracts.SchedulerLocks(l).Test(t)
 }
