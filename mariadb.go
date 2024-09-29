@@ -28,7 +28,7 @@ import (
 )
 
 type Connection struct {
-	flsql.ConnectionAdapter[*sql.DB, *sql.Tx]
+	flsql.ConnectionAdapter[sql.DB, sql.Tx]
 }
 
 func Connect(dsn string) (Connection, error) {
@@ -73,7 +73,7 @@ func (r Repository[ENT, ID]) Create(ctx context.Context, ptr *ENT) (rErr error) 
 	// depending on the value of "rErr".
 	defer comproto.FinishOnePhaseCommit(&rErr, r, ctx)
 
-	if err := r.Mapping.OnCreate(ctx, ptr); err != nil {
+	if err := r.Mapping.OnPrepare(ctx, ptr); err != nil {
 		return err
 	}
 
@@ -364,9 +364,9 @@ func (r Repository[ENT, ID]) Save(ctx context.Context, ptr *ENT) (rErr error) {
 		return fmt.Errorf("nil entity pointer given to Upsert")
 	}
 
-	if _, ok := r.Mapping.ID.Lookup(*ptr); !ok && r.Mapping.CreatePrepare != nil {
-		// if ID is not found, we assume it was never created before, so create peparation is required.
-		if err := r.Mapping.CreatePrepare(ctx, ptr); err != nil {
+	if _, ok := r.Mapping.ID.Lookup(*ptr); !ok {
+		// if ID is not found, we assume it was never created before, so preparation is required.
+		if err := r.Mapping.OnPrepare(ctx, ptr); err != nil {
 			return err
 		}
 	}
@@ -564,8 +564,8 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 		Connection: r.Connection,
 		Mapping: flsql.Mapping[cache.Hit[ID], cache.HitID]{
 			TableName: r.tableNameHits(),
-			ID: func(h *cache.Hit[ID]) *string {
-				return &h.QueryID
+			ID: func(h *cache.Hit[ID]) *cache.HitID {
+				return &h.ID
 			},
 			ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[cache.Hit[ID]]) {
 				return []flsql.ColumnName{"query_id", "ent_ids", "timestamp"},
@@ -574,7 +574,7 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 							return fmt.Errorf("nil %T was given for scanning", v)
 						}
 						var idDTOs []string
-						if err := s.Scan(&v.QueryID, JSON(&idDTOs), Timestamp(&v.Timestamp)); err != nil {
+						if err := s.Scan(&v.ID, JSON(&idDTOs), Timestamp(&v.Timestamp)); err != nil {
 							return err
 						}
 						v.EntityIDs = nil
@@ -602,16 +602,16 @@ func (r CacheRepository[ENT, ID]) Hits() cache.HitRepository[ID] {
 					idDTOs = append(idDTOs, idDTO)
 				}
 				return flsql.QueryArgs{
-					"query_id":  h.QueryID,
+					"query_id":  h.ID,
 					"ent_ids":   JSON(&idDTOs),
 					"timestamp": Timestamp(&h.Timestamp),
 				}, nil
 			},
-			CreatePrepare: func(ctx context.Context, h *cache.Hit[ID]) error {
+			Prepare: func(ctx context.Context, h *cache.Hit[ID]) error {
 				if h == nil {
 					return fmt.Errorf("nil %T was sent for %T.Hits().Create", h, r)
 				}
-				if h.QueryID == "" {
+				if h.ID == "" {
 					return fmt.Errorf("empty query id was given for %T", h)
 				}
 				return nil
@@ -663,7 +663,7 @@ func MakeMigrationStateRepository(conn Connection) Repository[migration.State, m
 				}, nil
 			},
 
-			CreatePrepare: func(ctx context.Context, s *migration.State) error {
+			Prepare: func(ctx context.Context, s *migration.State) error {
 				if s.ID.Namespace == "" {
 					return fmt.Errorf("mariadb.MigrationStateRepository requires a non-empty namespace for Create")
 				}
