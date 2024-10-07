@@ -46,13 +46,17 @@ func TestRepository(t *testing.T) {
 		crudcontracts.Finder[Entity, EntityID](subject, config),
 		crudcontracts.ByIDsFinder[Entity, EntityID](subject, config),
 		crudcontracts.Updater[Entity, EntityID](subject, config),
+		crudcontracts.Saver[Entity, EntityID](subject, config),
 		crudcontracts.Deleter[Entity, EntityID](subject, config),
 		crudcontracts.OnePhaseCommitProtocol[Entity, EntityID](subject, subject.Connection),
 	)
 }
 
 func TestCacheRepository(t *testing.T) {
-	// logger.Testing(t)
+	logger.Testing(t)
+	ctx := context.Background()
+	cm := GetConnection(t)
+
 	subject := mariadb.CacheRepository[testent.Foo, testent.FooID]{
 		Connection: GetConnection(t),
 		ID:         "foo",
@@ -69,8 +73,9 @@ func TestCacheRepository(t *testing.T) {
 			},
 		},
 	}
-	assert.NoError(t, subject.Migrate(context.Background()))
-	c := cachecontracts.Config[testent.Foo, testent.FooID]{
+	assert.NoError(t, subject.Migrate(ctx))
+
+	conf := cachecontracts.Config[testent.Foo, testent.FooID]{
 		CRUD: crudcontracts.Config[testent.Foo, testent.FooID]{
 			MakeEntity: func(tb testing.TB) testent.Foo {
 				foo := testent.MakeFoo(tb)
@@ -79,7 +84,10 @@ func TestCacheRepository(t *testing.T) {
 			},
 		},
 	}
-	cachecontracts.Repository(subject, c).Test(t)
+
+	cachecontracts.EntityRepository[testent.Foo, testent.FooID](subject.Entities(), cm, conf)
+	cachecontracts.HitRepository[testent.FooID](subject.Hits(), cm)
+	cachecontracts.Repository(subject, conf).Test(t)
 }
 
 func TestMigrationStateRepository(t *testing.T) {
@@ -196,11 +204,25 @@ func TestNewLockerFactory(t *testing.T) {
 
 	lockerFactoryStrKey := mariadb.LockerFactory[string]{Connection: cm}
 	assert.NoError(t, lockerFactoryStrKey.Migrate(ctx))
-	guardcontracts.LockerFactory[string](lockerFactoryStrKey).Test(t)
+	assert.NoError(t, lockerFactoryStrKey.Purge(ctx))
+
+	testcase.RunSuite(t,
+		guardcontracts.LockerFactory[string](lockerFactoryStrKey),
+		guardcontracts.NonBlockingLockerFactory[string](lockerFactoryStrKey),
+	)
+}
+
+func TestNewLockerFactory_altKeyInt(t *testing.T) {
+	ctx := context.Background()
+	cm := GetConnection(t)
 
 	lockerFactoryIntKey := mariadb.LockerFactory[int]{Connection: cm}
 	assert.NoError(t, lockerFactoryIntKey.Migrate(ctx))
-	guardcontracts.LockerFactory[int](lockerFactoryIntKey).Test(t)
+
+	testcase.RunSuite(t,
+		guardcontracts.LockerFactory[int](lockerFactoryIntKey),
+		guardcontracts.NonBlockingLockerFactory[int](lockerFactoryIntKey),
+	)
 }
 
 var _ migration.Migratable = mariadb.TaskerSchedulerLocks{}

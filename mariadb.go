@@ -31,16 +31,13 @@ import (
 	"go.llib.dev/frameless/port/migration"
 )
 
-type Connection struct {
-	flsql.ConnectionAdapter[sql.DB, sql.Tx]
-}
-
 func Connect(dsn string) (Connection, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return Connection{}, err
 	}
-	conn := Connection{ConnectionAdapter: flsql.SQLConnectionAdapter(db)}
+	ca := flsql.SQLConnectionAdapter(db)
+	conn := Connection{ConnectionAdapter: ca}
 	// SetConnMaxLifetime is required to ensure connections are closed by the driver safely before connection is closed by MySQL server,
 	// OS, or other middlewares. Since some middlewares close idle connections by 5 minutes,
 	// we recommend timeout shorter than 5 minutes.
@@ -55,6 +52,69 @@ func Connect(dsn string) (Connection, error) {
 	// If you want to close idle connections more rapidly, you can use db.SetConnMaxIdleTime() since Go 1.15.
 	db.SetMaxIdleConns(10)
 	return conn, nil
+}
+
+type Connection struct {
+	flsql.ConnectionAdapter[sql.DB, sql.Tx]
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+func lookupSessionVariable[T any](conn Connection, ctx context.Context, key string) (T, bool, error) {
+	var (
+		name string
+		val  T
+	)
+	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW SESSION VARIABLES LIKE '%s'", key))
+	err := row.Scan(&name, &val)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return *new(T), false, nil
+		} else {
+			return *new(T), false, err
+		}
+	}
+
+	return val, true, nil
+}
+
+func withSessionVariable[T any](conn Connection, ctx context.Context, key string, val T) (func() error, error) {
+	// Retrieve the current lock_wait_timeout value
+	var (
+		name string
+		og   T
+		had  bool = true
+	)
+
+	og, had, err := lookupSessionVariable[T](conn, ctx, key)
+	if err != nil {
+		return nil, err
+	}
+
+	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW SESSION VARIABLES LIKE '%s'", key))
+	if err := row.Scan(&name, &og); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			had = false
+		} else {
+			return nil, err
+		}
+	}
+
+	// Set lock wait timeout to 1 second (adjust as needed)
+	_, err = conn.ExecContext(ctx, fmt.Sprintf("SET SESSION %s = ?", key), val)
+	if err != nil {
+		return nil, err
+	}
+
+	return func() error {
+		if had && !zerokit.IsZero(og) {
+			_, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION %s = ?", key), og)
+			return err
+		} else {
+			_, err := conn.ExecContext(ctx, fmt.Sprintf("RESET SESSION %s", key))
+			return err
+		}
+	}, nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -690,36 +750,84 @@ type Locker struct {
 	Connection Connection
 }
 
-const queryLock = `INSERT INTO frameless_guard_locks (name) VALUES (?)`
+func (l Locker) beginLockTx(ctx context.Context) (*sql.Tx, error) {
+	// first we need a context that does't have a transaction in it
+	if _, ok := l.Connection.ConnectionAdapter.LookupTx(ctx); ok {
+		ctx = contextkit.WithoutValues(ctx)
+	}
+	return l.Connection.DB.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelReadCommitted, // READ COMMITED has less issue with table level locking
+	})
+}
+
+func (l Locker) TryLock(ctx context.Context) (_ context.Context, _ bool, rErr error) {
+	if ctx == nil {
+		return nil, false, errNoContext
+	}
+	if _, ok := l.lookup(ctx); ok {
+		return ctx, true, nil
+	}
+
+	tx, err := l.beginLockTx(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+
+	const tryLockQuery = `SELECT TRUE FROM frameless_guard_locks WHERE name = ? LIMIT 1 FOR UPDATE NOWAIT`
+	row := tx.QueryRowContext(ctx, tryLockQuery, l.Name)
+	var exists bool
+	err = row.Scan(&exists)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		msg := strings.ToLower(err.Error())
+		err = errorkit.Merge(err, tx.Rollback())
+		if strings.Contains(msg, "lock wait timeout") { // someone else already has the lock
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if exists {
+		return nil, false, tx.Rollback()
+	}
+	ctx, err = l.lock(ctx, tx)
+	if err != nil {
+		return nil, false, errorkit.Merge(err, tx.Rollback())
+	}
+	return ctx, true, nil
+}
 
 func (l Locker) Lock(ctx context.Context) (context.Context, error) {
 	if ctx == nil {
-		return nil, fmt.Errorf("missing context.Context")
+		return nil, errNoContext
 	}
-
 	if _, ok := l.lookup(ctx); ok {
 		return ctx, nil
 	}
 
-	ctx, err := l.Connection.BeginTx(ctx)
+	tx, err := l.beginLockTx(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = l.Connection.ExecContext(ctx, queryLock, l.Name)
+	return l.lock(ctx, tx)
+}
+
+const queryLock = `INSERT INTO frameless_guard_locks (name) VALUES (?)`
+
+func (l Locker) lock(ctx context.Context, tx *sql.Tx) (context.Context, error) {
+
+	_, err := tx.ExecContext(ctx, queryLock, l.Name)
 	if err != nil {
 		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-
 	lck := &lockerCtxValue{
-		ctx:        ctx,
-		cancel:     cancel,
-		Connection: l.Connection,
+		ctx:    ctx,
+		cancel: cancel,
+		tx:     tx,
 	}
 	context.AfterFunc(ctx, func() {
-		_ = lck.Unclock(ctx)
+		_ = lck.Unlock(ctx)
 	})
 	return context.WithValue(ctx, lockerCtxKey{}, lck), nil
 }
@@ -732,23 +840,22 @@ func (l Locker) Unlock(ctx context.Context) error {
 	if !ok {
 		return guard.ErrNoLock
 	}
-	return lck.Unclock(ctx)
+	return lck.Unlock(ctx)
 }
 
 type (
 	lockerCtxKey   struct{}
 	lockerCtxValue struct {
-		onUnlock   sync.Once
-		Connection Connection
-		done       bool
-		cancel     func()
-		ctx        context.Context
+		tx       *sql.Tx
+		ctx      context.Context
+		cancel   func()
+		onUnlock sync.Once
 	}
 )
 
-func (lck *lockerCtxValue) Unclock(ctx context.Context) (rerr error) {
+func (lck *lockerCtxValue) Unlock(ctx context.Context) (rerr error) {
 	lck.onUnlock.Do(func() {
-		if err := lck.Connection.RollbackTx(lck.ctx); err != nil {
+		if err := lck.tx.Rollback(); err != nil {
 			if driver.ErrBadConn == err && ctx.Err() != nil {
 				rerr = ctx.Err()
 				return
@@ -756,13 +863,16 @@ func (lck *lockerCtxValue) Unclock(ctx context.Context) (rerr error) {
 			rerr = err
 			return
 		}
+		rerr = errorkit.Merge(rerr, ctx.Err())
 		lck.cancel()
 	})
 	return rerr
 }
 
+const locksTableName = "frameless_guard_locks"
+
 func (l Locker) Migrate(ctx context.Context) error {
-	return MakeMigrator(l.Connection, "frameless_guard_locks", migration.Steps[Connection]{
+	return MakeMigrator(l.Connection, locksTableName, migration.Steps[Connection]{
 		"1": flsql.MigrationStep[Connection]{UpQuery: queries.CreateTableLocker},
 	}).Migrate(ctx)
 }
@@ -778,20 +888,37 @@ func (lf LockerFactory[Key]) Migrate(ctx context.Context) error {
 	return Locker{Connection: lf.Connection}.Migrate(ctx)
 }
 
+func (lf LockerFactory[Key]) Purge(ctx context.Context) error {
+	_, err := lf.Connection.ExecContext(ctx, fmt.Sprintf("DELETE FROM `%s`", locksTableName))
+	return err
+}
+
+func (lf LockerFactory[Key]) name(key Key) string {
+	return fmt.Sprintf("%T:%v", key, key)
+}
+
+func (lf LockerFactory[Key]) NonBlockingLockerFor(key Key) guard.NonBlockingLocker {
+	return Locker{Name: lf.name(key), Connection: lf.Connection}
+}
+
 func (lf LockerFactory[Key]) LockerFor(key Key) guard.Locker {
-	return Locker{Name: fmt.Sprintf("%T:%v", key, key), Connection: lf.Connection}
+	return Locker{Name: lf.name(key), Connection: lf.Connection}
 }
 
 //////////////////////////////////////////////////////////////// TASKER ////////////////////////////////////////////////////////////////
 
 type TaskerSchedulerLocks struct{ Connection Connection }
 
-func (lf TaskerSchedulerLocks) factory() LockerFactory[tasker.ScheduleStateID] {
-	return LockerFactory[tasker.ScheduleStateID](lf)
+func (lf TaskerSchedulerLocks) factory() LockerFactory[tasker.ScheduleID] {
+	return LockerFactory[tasker.ScheduleID](lf)
 }
 
-func (lf TaskerSchedulerLocks) LockerFor(id tasker.ScheduleStateID) guard.Locker {
+func (lf TaskerSchedulerLocks) LockerFor(id tasker.ScheduleID) guard.Locker {
 	return lf.factory().LockerFor(id)
+}
+
+func (lf TaskerSchedulerLocks) NonBlockingLockerFor(id tasker.ScheduleID) guard.NonBlockingLocker {
+	return lf.factory().NonBlockingLockerFor(id)
 }
 
 func (lf TaskerSchedulerLocks) Migrate(ctx context.Context) error {
@@ -800,14 +927,14 @@ func (lf TaskerSchedulerLocks) Migrate(ctx context.Context) error {
 
 type TaskerSchedulerStateRepository struct{ Connection Connection }
 
-func (r TaskerSchedulerStateRepository) repository() Repository[tasker.ScheduleState, tasker.ScheduleStateID] {
-	return Repository[tasker.ScheduleState, tasker.ScheduleStateID]{
+func (r TaskerSchedulerStateRepository) repository() Repository[tasker.ScheduleState, tasker.ScheduleID] {
+	return Repository[tasker.ScheduleState, tasker.ScheduleID]{
 		Mapping:    taskerScheduleStateRepositoryMapping,
 		Connection: r.Connection,
 	}
 }
 
-var taskerScheduleStateRepositoryMapping = flsql.Mapping[tasker.ScheduleState, tasker.ScheduleStateID]{
+var taskerScheduleStateRepositoryMapping = flsql.Mapping[tasker.ScheduleState, tasker.ScheduleID]{
 	TableName: "frameless_tasker_schedule_states",
 
 	ToQuery: func(ctx context.Context) ([]flsql.ColumnName, flsql.MapScan[tasker.ScheduleState]) {
@@ -821,7 +948,7 @@ var taskerScheduleStateRepositoryMapping = flsql.Mapping[tasker.ScheduleState, t
 			}
 	},
 
-	QueryID: func(si tasker.ScheduleStateID) (flsql.QueryArgs, error) {
+	QueryID: func(si tasker.ScheduleID) (flsql.QueryArgs, error) {
 		return flsql.QueryArgs{"id": si}, nil
 	},
 
@@ -839,7 +966,7 @@ var taskerScheduleStateRepositoryMapping = flsql.Mapping[tasker.ScheduleState, t
 		return nil
 	},
 
-	ID: func(s *tasker.ScheduleState) *tasker.ScheduleStateID {
+	ID: func(s *tasker.ScheduleState) *tasker.ScheduleID {
 		return &s.ID
 	},
 }
@@ -861,10 +988,12 @@ func (r TaskerSchedulerStateRepository) Update(ctx context.Context, ptr *tasker.
 	return r.repository().Update(ctx, ptr)
 }
 
-func (r TaskerSchedulerStateRepository) DeleteByID(ctx context.Context, id tasker.ScheduleStateID) error {
+func (r TaskerSchedulerStateRepository) DeleteByID(ctx context.Context, id tasker.ScheduleID) error {
 	return r.repository().DeleteByID(ctx, id)
 }
 
-func (r TaskerSchedulerStateRepository) FindByID(ctx context.Context, id tasker.ScheduleStateID) (ent tasker.ScheduleState, found bool, err error) {
+func (r TaskerSchedulerStateRepository) FindByID(ctx context.Context, id tasker.ScheduleID) (ent tasker.ScheduleState, found bool, err error) {
 	return r.repository().FindByID(ctx, id)
 }
+
+const errNoContext errorkit.Error = "ErrNoContext"
