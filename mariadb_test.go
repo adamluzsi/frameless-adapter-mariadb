@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"testing"
+	"time"
 
 	"go.llib.dev/frameless/adapter/mariadb"
 	"go.llib.dev/frameless/adapter/mariadb/internal/queries"
@@ -242,4 +243,38 @@ func TestTaskerSchedulerLocks(t *testing.T) {
 	l := mariadb.TaskerSchedulerLocks{Connection: cm}
 	assert.NoError(t, l.Migrate(context.Background()))
 	taskercontracts.SchedulerLocks(l).Test(t)
+}
+
+func TestLockerFactory_Namespace_smoke(t *testing.T) {
+	logger.Testing(t)
+	cm := GetConnection(t)
+
+	lf1 := mariadb.LockerFactory[string]{
+		Connection: cm,
+		Namespace:  "1",
+	}
+
+	lf2 := mariadb.LockerFactory[string]{
+		Connection: cm,
+		Namespace:  "2",
+	}
+
+	const key = "lock-name"
+
+	locker1 := lf1.LockerFor(key)
+	locker2 := lf2.LockerFor(key)
+
+	ctx := context.Background()
+
+	assert.Within(t, time.Second, func(context.Context) {
+		lctx1, err := locker1.Lock(ctx)
+		assert.NoError(t, err)
+		t.Cleanup(func() { locker1.Unlock(lctx1) })
+	})
+
+	assert.Within(t, time.Second, func(context.Context) {
+		lctx2, err := locker2.Lock(ctx)
+		assert.NoError(t, err)
+		defer locker2.Unlock(lctx2)
+	})
 }

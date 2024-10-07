@@ -58,67 +58,6 @@ type Connection struct {
 	flsql.ConnectionAdapter[sql.DB, sql.Tx]
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-func lookupSessionVariable[T any](conn Connection, ctx context.Context, key string) (T, bool, error) {
-	var (
-		name string
-		val  T
-	)
-	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW SESSION VARIABLES LIKE '%s'", key))
-	err := row.Scan(&name, &val)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return *new(T), false, nil
-		} else {
-			return *new(T), false, err
-		}
-	}
-
-	return val, true, nil
-}
-
-func withSessionVariable[T any](conn Connection, ctx context.Context, key string, val T) (func() error, error) {
-	// Retrieve the current lock_wait_timeout value
-	var (
-		name string
-		og   T
-		had  bool = true
-	)
-
-	og, had, err := lookupSessionVariable[T](conn, ctx, key)
-	if err != nil {
-		return nil, err
-	}
-
-	row := conn.QueryRowContext(ctx, fmt.Sprintf("SHOW SESSION VARIABLES LIKE '%s'", key))
-	if err := row.Scan(&name, &og); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			had = false
-		} else {
-			return nil, err
-		}
-	}
-
-	// Set lock wait timeout to 1 second (adjust as needed)
-	_, err = conn.ExecContext(ctx, fmt.Sprintf("SET SESSION %s = ?", key), val)
-	if err != nil {
-		return nil, err
-	}
-
-	return func() error {
-		if had && !zerokit.IsZero(og) {
-			_, err := conn.ExecContext(ctx, fmt.Sprintf("SET SESSION %s = ?", key), og)
-			return err
-		} else {
-			_, err := conn.ExecContext(ctx, fmt.Sprintf("RESET SESSION %s", key))
-			return err
-		}
-	}, nil
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
 // Repository implements CRUD operations for a specific entity type in mariadb.
 type Repository[ENT, ID any] struct {
 	Connection Connection
@@ -882,7 +821,11 @@ func (l Locker) lookup(ctx context.Context) (*lockerCtxValue, bool) {
 	return v, ok
 }
 
-type LockerFactory[Key comparable] struct{ Connection Connection }
+type LockerFactory[Key comparable] struct {
+	Connection Connection
+	// Namespace [optional] allows you to make isolation between locks generated with the same key but for a different namesapce.
+	Namespace string
+}
 
 func (lf LockerFactory[Key]) Migrate(ctx context.Context) error {
 	return Locker{Connection: lf.Connection}.Migrate(ctx)
@@ -894,7 +837,11 @@ func (lf LockerFactory[Key]) Purge(ctx context.Context) error {
 }
 
 func (lf LockerFactory[Key]) name(key Key) string {
-	return fmt.Sprintf("%T:%v", key, key)
+	name := fmt.Sprintf("%T:%v", key, key)
+	if lf.Namespace != "" {
+		name = lf.Namespace + "/" + name
+	}
+	return name
 }
 
 func (lf LockerFactory[Key]) NonBlockingLockerFor(key Key) guard.NonBlockingLocker {
@@ -910,7 +857,7 @@ func (lf LockerFactory[Key]) LockerFor(key Key) guard.Locker {
 type TaskerSchedulerLocks struct{ Connection Connection }
 
 func (lf TaskerSchedulerLocks) factory() LockerFactory[tasker.ScheduleID] {
-	return LockerFactory[tasker.ScheduleID](lf)
+	return LockerFactory[tasker.ScheduleID]{Connection: lf.Connection}
 }
 
 func (lf TaskerSchedulerLocks) LockerFor(id tasker.ScheduleID) guard.Locker {
