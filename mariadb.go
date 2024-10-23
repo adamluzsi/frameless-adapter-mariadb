@@ -521,7 +521,7 @@ func (r CacheRepository[ENT, ID]) Entities() cache.EntityRepository[ENT, ID] {
 						}
 						var (
 							idDTO      string
-							dataDTOPtr = r.jsonDTOM().NewiDTO()
+							dataDTOPtr = r.jsonDTOM().NewDTO()
 						)
 						if err := s.Scan(&idDTO, JSON(&dataDTOPtr)); err != nil {
 							return err
@@ -530,7 +530,7 @@ func (r CacheRepository[ENT, ID]) Entities() cache.EntityRepository[ENT, ID] {
 						if err != nil {
 							return err
 						}
-						ent, err := r.jsonDTOM().MapFromiDTOPtr(ctx, dataDTOPtr)
+						ent, err := r.jsonDTOM().MapFromDTO(ctx, dataDTOPtr)
 						if err != nil {
 							return err
 						}

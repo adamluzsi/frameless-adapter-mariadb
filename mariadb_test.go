@@ -234,7 +234,7 @@ func TestTaskerSchedulerStateRepository(t *testing.T) {
 
 	r := mariadb.TaskerSchedulerStateRepository{Connection: cm}
 	assert.NoError(t, r.Migrate(context.Background()))
-	taskercontracts.SchedulerStateRepository(r).Test(t)
+	taskercontracts.ScheduleStateRepository(r).Test(t)
 }
 
 func TestTaskerSchedulerLocks(t *testing.T) {
