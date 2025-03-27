@@ -18,6 +18,7 @@ import (
 	"go.llib.dev/frameless/pkg/dtokit"
 	"go.llib.dev/frameless/pkg/errorkit"
 	"go.llib.dev/frameless/pkg/flsql"
+	"go.llib.dev/frameless/pkg/iterkit"
 	"go.llib.dev/frameless/pkg/logger"
 	"go.llib.dev/frameless/pkg/logging"
 	"go.llib.dev/frameless/pkg/slicekit"
@@ -27,7 +28,6 @@ import (
 	"go.llib.dev/frameless/port/crud"
 	"go.llib.dev/frameless/port/crud/extid"
 	"go.llib.dev/frameless/port/guard"
-	"go.llib.dev/frameless/port/iterators"
 	"go.llib.dev/frameless/port/migration"
 )
 
@@ -87,10 +87,9 @@ func (r Repository[ENT, ID]) Create(ctx context.Context, ptr *ENT) (rErr error) 
 			return err
 		}
 		if found {
-			return errorkit.With(crud.ErrAlreadyExists).
-				Detailf(`%T already exists with id: %v`, *new(ENT), id).
-				Context(ctx).
-				Unwrap()
+			err := crud.ErrAlreadyExists.F(`%T already exists with id: %v`, *new(ENT), id)
+			err = errorkit.WithContext(err, ctx)
+			return err
 		}
 	}
 
@@ -270,32 +269,24 @@ func (r Repository[ENT, ID]) Update(ctx context.Context, ptr *ENT) (rErr error) 
 	return nil
 }
 
-func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterators.Iterator[ENT], error) {
+func (r Repository[ENT, ID]) FindAll(ctx context.Context) (iterkit.ErrIter[ENT], error) {
 	cols, scan := r.Mapping.ToQuery(ctx)
-
 	query := fmt.Sprintf("SELECT %s FROM `%s`",
 		flsql.JoinColumnName(cols, "`%s`", ", "),
 		r.Mapping.TableName,
 	)
-
-	rows, err := r.Connection.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
+	return flsql.QueryMany(r.Connection, ctx, scan.Map, query)
 }
 
-func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterators.Iterator[ENT], error) {
+func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterkit.ErrIter[ENT], error) {
 	if len(ids) == 0 {
-		return iterators.Empty[ENT](), nil
+		return iterkit.Empty2[ENT, error](), nil
 	}
 
 	var (
 		whereClauses []string
-		queryArgs    []interface{}
+		queryArgs    []any
 	)
-
 	for _, id := range ids {
 		idArgs, err := r.Mapping.QueryID(id)
 		if err != nil {
@@ -307,7 +298,6 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterator
 	}
 
 	cols, scan := r.Mapping.ToQuery(ctx)
-
 	query := fmt.Sprintf("SELECT `%s` FROM `%s` WHERE %s",
 		strings.Join(slicekit.Map(cols, func(c flsql.ColumnName) string { return string(c) }), "`, `"),
 		r.Mapping.TableName,
@@ -327,13 +317,7 @@ func (r Repository[ENT, ID]) FindByIDs(ctx context.Context, ids ...ID) (iterator
 			return nil, crud.ErrNotFound
 		}
 	}
-
-	rows, err := r.Connection.QueryContext(ctx, query, queryArgs...)
-	if err != nil {
-		return nil, err
-	}
-
-	return flsql.MakeSQLRowsIterator[ENT](rows, scan), nil
+	return flsql.QueryMany(r.Connection, ctx, scan.Map, query, queryArgs...)
 }
 
 // BeginTx implements the comproto.OnePhaseCommitter interface.
@@ -789,23 +773,22 @@ type (
 		ctx      context.Context
 		cancel   func()
 		onUnlock sync.Once
+
+		Error error
 	}
 )
 
-func (lck *lockerCtxValue) Unlock(ctx context.Context) (rerr error) {
+func (lck *lockerCtxValue) Unlock(ctx context.Context) error {
 	lck.onUnlock.Do(func() {
-		if err := lck.tx.Rollback(); err != nil {
-			if driver.ErrBadConn == err && ctx.Err() != nil {
-				rerr = ctx.Err()
-				return
-			}
-			rerr = err
-			return
+		lckCtxErr := lck.ctx.Err()
+		rollbackErr := lck.tx.Rollback()
+		if errors.Is(rollbackErr, driver.ErrBadConn) && ctx.Err() != nil {
+			rollbackErr = nil
 		}
-		rerr = errorkit.Merge(rerr, ctx.Err())
+		lck.Error = errorkit.Merge(rollbackErr, lckCtxErr, ctx.Err())
 		lck.cancel()
 	})
-	return rerr
+	return lck.Error
 }
 
 const locksTableName = "frameless_guard_locks"
